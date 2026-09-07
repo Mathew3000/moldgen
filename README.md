@@ -65,6 +65,7 @@ python moldgen.py MODEL --out PREFIX [options]
 | `--up` | `z` | Which model axis points "up" toward the pour side |
 | `--seam-axis` | `z` | Which axis each parting plane is perpendicular to. One value (default) = the classic 2-piece clamshell. `x`/`y` = a vertical seam instead, for undercuts on the sides rather than top/bottom. **Two values = a 4-piece +/X split; three = 8 pieces.** Pair positionally with `--seam` |
 | `--seam` | `0.5` | Seam position(s) as a fraction (0–1) of the model's extent along the matching `--seam-axis` entry |
+| `--seam-parent` | `-` | Makes a seam partial instead of a full plane. `-` = full plane, applies to every piece so far. `N+`/`N-` = only splits pieces already on the +/− side of seam `N` (0-based, must be an earlier seam) — this is how a **T split** works |
 | `--preview` | off | Save a shaded preview PNG next to the STLs (exploded view, or a cutaway if `--sleeve` is set) |
 
 `--up` and `--seam-axis` are independent: `--up` decides which way the
@@ -102,7 +103,7 @@ use on larger molds.
 |---|---|---|
 | `--hollow` | off | Hollow the mold bulk into a shell |
 | `--skin` | `2.0` | Outer skin thickness when `--hollow` is set (mm) |
-| `--open-back` | off | With `--hollow`: leave off each half's outer face entirely (the one opposite the cavity, parallel to it) instead of skinning it over, replacing it with a "+"-shaped brace standing perpendicular to it — a vacuum-formed-shell look (contoured wall + side walls + open back) rather than a fully boxed-in shell |
+| `--open-back` | off | With `--hollow`: leave off each piece's outer face(s) entirely (opposite the cavity, one per seam that bounds it) instead of skinning them over, replacing each with a "+"-shaped brace standing perpendicular to it — a vacuum-formed-shell look (contoured wall + side walls + open back) rather than a fully boxed-in shell. Works with any number of seams, including partial ones (T): each piece opens only on the seams that actually bound it — a T split's trunk, unconstrained by the partial stem seam, stays closed on that axis while opening on its own bar-seam axis |
 | `--cross-width` | `4.0` | Width of each brace rib when `--open-back` is set (mm) |
 
 Material savings scale with mold size: a small mold is mostly wall already,
@@ -172,6 +173,12 @@ python moldgen.py figurine.stl --out fig_mold --seam-axis z x --seam 0.5 0.5 --p
 python moldgen.py figurine.stl --out fig_mold --seam-axis z x y --seam 0.5 0.5 0.5 --pins 2
 ```
 
+T-split mold (a full horizontal "-" bar, plus a "|" stem that only splits
+the crown above the bar — the trunk below stays a single uncut piece):
+```
+python moldgen.py figurine.stl --out fig_mold --seam-axis z x --seam 0.5 0.5 --seam-parent - 0+ --pins 2 --preview
+```
+
 Hollow-cast candle with a removable core:
 ```
 python moldgen.py candle_master.stl --out candle_mold --sleeve --sleeve-wall 3 --preview
@@ -198,10 +205,11 @@ anything hot (e.g. wax).
   the outer face open, it only finds solid material where it lands on the
   side-wall ring or the cross, not across its whole area — usually fine,
   but check the flange size/position for your model if you combine the two.
-- `--sleeve` and `--open-back` currently only support a single `--seam-axis`
-  — each assumes one parting line. Using either with multiple seams raises
-  an error rather than producing something subtly wrong; support for both
-  is planned.
+- `--sleeve` currently only supports a single `--seam-axis` — it assumes
+  one parting line for the base opening/core. Using it with multiple seams
+  raises an error rather than producing something subtly wrong; support is
+  planned. `--open-back` has no such restriction — it works with any number
+  of seams, including T's partial one.
 
 ### A note on watertightness checks
 
