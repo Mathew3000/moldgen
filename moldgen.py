@@ -63,7 +63,26 @@ def manifold_to_trimesh(man: mf.Manifold) -> trimesh.Trimesh:
     mesh = man.to_mesh()
     verts = np.array(mesh.vert_properties)[:, :3]
     tris = np.array(mesh.tri_verts)
-    return trimesh.Trimesh(vertices=verts, faces=tris, process=False)
+    tm = trimesh.Trimesh(vertices=verts, faces=tris, process=False)
+    # Long chains of booleans can leave a handful of zero-area "sliver"
+    # faces behind (degenerate leftovers at tangent/edge-case contacts,
+    # confirmed with heavily-combined option sets) - individually harmless
+    # but they show up as tiny disconnected junk shells in the output file.
+    # Manifold itself reports no error at any step; this is purely an
+    # export-side cleanup.
+    tm.update_faces(tm.nondegenerate_faces())
+    tm.remove_unreferenced_vertices()
+    return tm
+
+
+def verify_watertight(path: str) -> bool:
+    """Check watertightness by reloading the file that was just exported,
+    rather than trusting the pre-export in-memory object - confirmed during
+    development that the two can disagree in both directions (STL is a
+    triangle-soup format with no shared-vertex topology, so export/reload
+    reconstructs connectivity from scratch; this is the check that reflects
+    what a slicer will actually load)."""
+    return trimesh.load(path).is_watertight
 
 
 # --------------------------------------------------------------------------
@@ -174,6 +193,13 @@ def add_registration_pins(part_pos, part_neg, bounds, seam_axis, seam_offset,
     embed = wall * 0.75
     protrude = wall * 0.75
     socket_extra_depth = 0.3  # so the pin doesn't bottom out and hold the seam open
+    seam_overlap = 0.2  # push the socket's cut plane past the seam split rather
+    # than starting exactly on it - exact coincidence between a cut boundary
+    # and a split plane is a classic degenerate case for boolean robustness
+    # (confirmed: without this, the socket can come out as a fully sealed
+    # pocket instead of an opening, under just the right combination of
+    # other geometry in the chain). part_pos has nothing below seam_offset
+    # to begin with, so this overlap is a no-op there beyond fixing that.
 
     for (uu, vv) in positions:
         male = cylinder_along_axis(embed + protrude, pin_r, pin_r, 24, seam_axis)
@@ -182,53 +208,101 @@ def add_registration_pins(part_pos, part_neg, bounds, seam_axis, seam_offset,
         part_neg = part_neg + male
 
         socket_r = pin_r + fit_clearance
-        female = cylinder_along_axis(protrude + socket_extra_depth, socket_r, socket_r, 24, seam_axis)
+        female = cylinder_along_axis(protrude + socket_extra_depth + seam_overlap,
+                                      socket_r, socket_r, 24, seam_axis)
         female = female.translate(point_from_axes(
-            {seam_axis: seam_offset, u_axis: uu, v_axis: vv}))
+            {seam_axis: seam_offset - seam_overlap, u_axis: uu, v_axis: vv}))
         part_pos = part_pos - female
 
     return part_pos, part_neg
 
 
-def add_pour_funnel(body, apex_xy, apex_z, wall, funnel_top_dia, funnel_bot_dia,
-                     overlap=2.0):
-    """Bore a tapered funnel from the mold's outer top surface down into the
-    cavity, extending `overlap` mm past the model's highest point.
+def build_funnel_solid(apex_xy, apex_z, wall, funnel_top_dia, funnel_bot_dia,
+                        overlap=2.0, pad=0.0):
+    """The funnel's own solid volume: a tapered mouth plus a straight,
+    constant-radius channel continuing `overlap` mm past the model's
+    highest point (see the docstring on why - a real, substantial opening
+    rather than a knife-edge connection).
 
-    The previous version only carried the bore down to apex_z (plus a
-    0.01mm epsilon needed for the boolean, not for function), so wherever
-    the model has any real taper near its peak, the funnel met the cavity
-    through little more than a sliver - fine mathematically, but not enough
-    of an opening for a real, somewhat-viscous liquid to pour through
-    reliably. `overlap` adds a straight, constant-radius (funnel_bot_dia)
-    channel continuing past the taper, so there's a substantial, consistent
-    opening into the cavity rather than a knife-edge connection.
+    `pad`, if given, grows every radius (and stretches the top/bottom
+    accordingly) by that amount - used to build a same-family "outer"
+    version of this shape for `build_funnel_jacket` rather than subtracted
+    directly.
+
+    Returned as a solid shape rather than subtracted in place, so it can be
+    used both to actually open the channel and (via `build_funnel_jacket`)
+    to give it a proper wall-thickness tube first.
     """
-    r_bot = funnel_bot_dia / 2.0
-    r_top = funnel_top_dia / 2.0
+    r_bot = funnel_bot_dia / 2.0 + pad
+    r_top = funnel_top_dia / 2.0 + pad
     taper = mf.Manifold.cylinder(
-        wall + 0.02, r_bot, r_top, 32, center=False
-    ).translate((apex_xy[0], apex_xy[1], apex_z - 0.01))
+        wall + 0.02 + 2 * pad, r_bot, r_top, 32, center=False
+    ).translate((apex_xy[0], apex_xy[1], apex_z - 0.01 - pad))
     straight = mf.Manifold.cylinder(
-        overlap + 0.02, r_bot, r_bot, 32, center=False
-    ).translate((apex_xy[0], apex_xy[1], apex_z - overlap - 0.01))
-    funnel = taper + straight
-    return body - funnel
+        overlap + 0.02 + pad, r_bot, r_bot, 32, center=False
+    ).translate((apex_xy[0], apex_xy[1], apex_z - overlap - 0.01 - pad))
+    return taper + straight
 
 
-def add_vent(top, xy, apex_z, wall, vent_dia):
-    r = vent_dia / 2.0
-    vent = mf.Manifold.cylinder(
-        wall + 0.02, r, r, 20, center=False
-    ).translate((xy[0], xy[1], apex_z - 0.01))
-    return top - vent
+def build_funnel_jacket(apex_xy, apex_z, wall, funnel_top_dia, funnel_bot_dia,
+                         overlap, model):
+    """A `wall`-thick tube wrapped directly around the funnel bore, so
+    hollowing doesn't leave the pour channel as just an unsupported hole
+    with no walls once it's past cavity_shell's reach around the model.
+
+    Built as two same-family funnel shapes (see `build_funnel_solid`'s
+    `pad`) and subtracted, rather than via a Minkowski offset of the bore
+    unioned with the model - growing a Minkowski offset around a large
+    model unioned with a thin, far-away tube reliably produced bad topology
+    (multiple disconnected shells); two direct, well-formed solids don't
+    have that problem.
+    """
+    inner = build_funnel_solid(apex_xy, apex_z, wall, funnel_top_dia, funnel_bot_dia,
+                                overlap, pad=0.0)
+    outer = build_funnel_solid(apex_xy, apex_z, wall, funnel_top_dia, funnel_bot_dia,
+                                overlap, pad=wall)
+    return (outer - inner) - model
+
+
+def build_vent_solid(xy, apex_z, wall, vent_dia, pad=0.0):
+    r = vent_dia / 2.0 + pad
+    h = wall + 0.02 + 2 * pad
+    return mf.Manifold.cylinder(h, r, r, 20, center=False).translate(
+        (xy[0], xy[1], apex_z - 0.01 - pad)
+    )
+
+
+def build_vent_jacket(xy, apex_z, wall, vent_dia, model):
+    inner = build_vent_solid(xy, apex_z, wall, vent_dia, pad=0.0)
+    outer = build_vent_solid(xy, apex_z, wall, vent_dia, pad=wall)
+    return (outer - inner) - model
 
 
 # --------------------------------------------------------------------------
 # Hollowing: replace the solid bulk of the mold body with a thin shell
 # --------------------------------------------------------------------------
 
-def hollow_body(model, blank, wall, skin, seam_axis, seam_offset):
+def face_slab(bounds, axis, side, thickness):
+    """A thin box, `thickness` deep along `axis` at its 'lo' or 'hi' boundary,
+    spanning the FULL extent of the other two axes. One face of a box-shell,
+    built individually so a particular face can be left out of the union."""
+    u_axis, v_axis = other_axes(axis)
+    lo, hi = bounds[axis]
+    if side == "lo":
+        a0, a1 = lo, lo + thickness
+    else:
+        a0, a1 = hi - thickness, hi
+    dims = {
+        axis: a1 - a0,
+        u_axis: bounds[u_axis][1] - bounds[u_axis][0],
+        v_axis: bounds[v_axis][1] - bounds[v_axis][0],
+    }
+    origin = {axis: a0, u_axis: bounds[u_axis][0], v_axis: bounds[v_axis][0]}
+    return mf.Manifold.cube(point_from_axes(dims), center=False).translate(point_from_axes(origin))
+
+
+def hollow_body(model, blank, wall, skin, seam_axis, seam_offset,
+                 open_back=False, cross_width=4.0):
     """Turn a solid `blank - model` body into a shell to save filament.
 
     Keeps three regions, unions them, then re-clips to the cavity:
@@ -242,9 +316,24 @@ def hollow_body(model, blank, wall, skin, seam_axis, seam_offset):
                        material for the registration pins to embed into.
     Everything else in the original solid bulk becomes empty void.
 
-    Note: for large molds the unsupported span of skin over the void can be
-    significant - if it's wide, add internal ribs/gyroid infill as a next
-    step, or fall back to solid (--hollow off) for that mold.
+    With `open_back`, this becomes closer to a vacuum-formed shell: the two
+    outer faces perpendicular to seam_axis (each half's own "back", opposite
+    the cavity - the ones with the least functional need to be solid, since
+    they don't seal against anything) are left off skin_shell entirely, and
+    replaced with a "+"-shaped brace standing perpendicular to them (in the
+    same two planes as the four side walls, running the full depth) for
+    rigidity in place of a full panel.
+
+    Note: without open_back, for large molds the unsupported span of skin
+    over the void can be significant - if it's wide, add internal ribs/
+    gyroid infill as a next step, or fall back to solid (--hollow off).
+
+    The funnel/vent bores get their own protective "jacket" added
+    separately by the caller (see `build_funnel_jacket`) rather than being
+    folded in here - growing a Minkowski offset around the union of a large
+    model and a thin, far-away tube reliably produced bad topology (multiple
+    disconnected shells), so the jacket is instead built directly as its own
+    simple, well-formed shape and just unioned in afterward.
     """
     # Cavity-side shell via a true outward offset (Minkowski sum with a
     # sphere). Simplify first: the offset surface is hidden inside the wall,
@@ -255,20 +344,43 @@ def hollow_body(model, blank, wall, skin, seam_axis, seam_offset):
     grown = simplified.minkowski_sum(ball)
     cavity_shell = grown - model
 
-    # Outer skin shell: blank minus a version of itself shrunk inward by `skin`
     bounds = bbox_dict(blank.bounding_box())
-    inner_dims = {a: (bounds[a][1] - bounds[a][0] - 2 * skin) for a in _AXES}
-    if min(inner_dims.values()) <= 0:
-        raise ValueError("--skin is too large for this mold's size.")
-    inner_origin = {a: bounds[a][0] + skin for a in _AXES}
-    inner = mf.Manifold.cube(point_from_axes(inner_dims), center=False).translate(
-        point_from_axes(inner_origin)
-    )
-    skin_shell = blank - inner
+    u_axis, v_axis = other_axes(seam_axis)
+
+    if open_back:
+        # Only the 4 side faces (S) - leave both seam_axis-facing faces (O,
+        # each half's own "back") out entirely.
+        skin_shell = (
+            face_slab(bounds, u_axis, "lo", skin) + face_slab(bounds, u_axis, "hi", skin)
+            + face_slab(bounds, v_axis, "lo", skin) + face_slab(bounds, v_axis, "hi", skin)
+        )
+        lo, hi = bounds[seam_axis]
+        u_lo, u_hi = bounds[u_axis]
+        v_lo, v_hi = bounds[v_axis]
+        if cross_width >= (u_hi - u_lo) or cross_width >= (v_hi - v_lo):
+            raise ValueError("--cross-width is too large for this mold's footprint.")
+        u_mid, v_mid = (u_lo + u_hi) / 2.0, (v_lo + v_hi) / 2.0
+        rib_u = mf.Manifold.cube(point_from_axes(
+            {seam_axis: hi - lo, u_axis: cross_width, v_axis: v_hi - v_lo}), center=False
+        ).translate(point_from_axes({seam_axis: lo, u_axis: u_mid - cross_width / 2.0, v_axis: v_lo}))
+        rib_v = mf.Manifold.cube(point_from_axes(
+            {seam_axis: hi - lo, u_axis: u_hi - u_lo, v_axis: cross_width}), center=False
+        ).translate(point_from_axes({seam_axis: lo, u_axis: u_lo, v_axis: v_mid - cross_width / 2.0}))
+        skin_shell = skin_shell + rib_u + rib_v
+    else:
+        # Outer skin shell: blank minus a version of itself shrunk inward by `skin`
+        inner_dims = {a: (bounds[a][1] - bounds[a][0] - 2 * skin) for a in _AXES}
+        if min(inner_dims.values()) <= 0:
+            raise ValueError("--skin is too large for this mold's size.")
+        inner_origin = {a: bounds[a][0] + skin for a in _AXES}
+        inner = mf.Manifold.cube(point_from_axes(inner_dims), center=False).translate(
+            point_from_axes(inner_origin)
+        )
+        skin_shell = blank - inner
 
     # Seam slab: keep a solid band (+-wall) around the parting plane, full
-    # extent in the other two axes
-    u_axis, v_axis = other_axes(seam_axis)
+    # extent in the other two axes - unaffected by open_back, this is a
+    # different face (the parting line) and always needs to stay solid.
     slab_dims = {
         seam_axis: 2 * wall,
         u_axis: bounds[u_axis][1] - bounds[u_axis][0],
@@ -362,7 +474,7 @@ def generate_mold(input_path, out_prefix, wall, up_axis, seam_axis, seam_fractio
                    n_pins, pin_dia, fit_clearance, pin_margin,
                    funnel_top_dia, funnel_bot_dia, funnel_overlap,
                    pour_offset_xy, vent_dia, vent_offset_xy,
-                   hollow=False, skin=2.0,
+                   hollow=False, skin=2.0, open_back=False, cross_width=4.0,
                    sleeve=False, sleeve_wall=3.0, sleeve_clearance=0.3,
                    sleeve_flange_margin=3.0, sleeve_flange_thickness=2.5):
 
@@ -406,6 +518,20 @@ def generate_mold(input_path, out_prefix, wall, up_axis, seam_axis, seam_fractio
     seam_lo, seam_hi = model_bounds[seam_axis]
     seam_offset = seam_lo + seam_fraction * (seam_hi - seam_lo)
 
+    # Build the funnel (and vent) solids now, before hollowing - so that if
+    # hollowing is on, it can add a proper wall-thickness jacket around the
+    # pour channel, rather than the channel just dissolving into the
+    # general void wherever it isn't already inside cavity_shell's reach.
+    default_xy = ((xmin + xmax) / 2.0, (ymin + ymax) / 2.0)
+    apex_xy = (default_xy[0] + pour_offset_xy[0], default_xy[1] + pour_offset_xy[1])
+    funnel_solid = build_funnel_solid(apex_xy, zmax, wall, funnel_top_dia, funnel_bot_dia,
+                                       overlap=funnel_overlap)
+    vent_solid = None
+    vent_xy = None
+    if vent_dia > 0:
+        vent_xy = (default_xy[0] + vent_offset_xy[0], default_xy[1] + vent_offset_xy[1])
+        vent_solid = build_vent_solid(vent_xy, zmax, wall, vent_dia)
+
     # 2. Carve the cavity
     solid_body = blank - model
     if solid_body.is_empty():
@@ -413,7 +539,15 @@ def generate_mold(input_path, out_prefix, wall, up_axis, seam_axis, seam_fractio
 
     # 2b. Optionally hollow the bulk out into a shell to save filament
     if hollow:
-        body = hollow_body(model, blank, wall, skin, seam_axis, seam_offset)
+        body = hollow_body(model, blank, wall, skin, seam_axis, seam_offset,
+                            open_back=open_back, cross_width=cross_width)
+        # Give the pour channel(s) a proper wall-thickness jacket, since
+        # otherwise whatever part of them is past cavity_shell's reach
+        # around the model just dissolves into the general void.
+        body = body + build_funnel_jacket(apex_xy, zmax, wall, funnel_top_dia,
+                                           funnel_bot_dia, funnel_overlap, model)
+        if vent_solid is not None:
+            body = body + build_vent_jacket(vent_xy, zmax, wall, vent_dia, model)
         print(f"hollowed: {solid_body.volume():.0f} mm3 -> {body.volume():.0f} mm3 "
               f"({100 * (1 - body.volume() / solid_body.volume()):.0f}% material saved)")
     else:
@@ -431,18 +565,15 @@ def generate_mold(input_path, out_prefix, wall, up_axis, seam_axis, seam_fractio
             sleeve_flange_margin, sleeve_flange_thickness,
         )
 
-    # 3. Pour funnel and vent, bored before splitting: with a vertical seam
-    #    this naturally divides the pour channel between both halves (the
+    # 3. Actually open the pour funnel and vent up now, subtracting the same
+    #    solids used above - bored before splitting, so with a vertical seam
+    #    this naturally divides the channel between both halves (the
     #    standard way real 2-part molds route a sprue across a vertical
     #    parting line), and for the default horizontal seam it lands
     #    entirely in the top half exactly as before.
-    default_xy = ((xmin + xmax) / 2.0, (ymin + ymax) / 2.0)
-    apex_xy = (default_xy[0] + pour_offset_xy[0], default_xy[1] + pour_offset_xy[1])
-    body = add_pour_funnel(body, apex_xy, zmax, wall, funnel_top_dia, funnel_bot_dia,
-                            overlap=funnel_overlap)
-    if vent_dia > 0:
-        vent_xy = (default_xy[0] + vent_offset_xy[0], default_xy[1] + vent_offset_xy[1])
-        body = add_vent(body, vent_xy, zmax, wall, vent_dia)
+    body = body - funnel_solid
+    if vent_solid is not None:
+        body = body - vent_solid
 
     # 4. Split on the seam plane
     seam_normal = point_from_axes({seam_axis: 1.0})
@@ -468,9 +599,9 @@ def generate_mold(input_path, out_prefix, wall, up_axis, seam_axis, seam_fractio
     top_tm.export(top_path)
     bottom_tm.export(bottom_path)
 
-    print(f"top half:    {top_path}  watertight={top_tm.is_watertight}  "
+    print(f"top half:    {top_path}  watertight={verify_watertight(top_path)}  "
           f"volume={top.volume():.1f} mm3")
-    print(f"bottom half: {bottom_path}  watertight={bottom_tm.is_watertight}  "
+    print(f"bottom half: {bottom_path}  watertight={verify_watertight(bottom_path)}  "
           f"volume={bottom.volume():.1f} mm3")
 
     core_tm = None
@@ -481,7 +612,7 @@ def generate_mold(input_path, out_prefix, wall, up_axis, seam_axis, seam_fractio
         core_tm = rotate_mesh(manifold_to_trimesh(core), inv_rot)
         core_path = f"{out_prefix}_core.stl"
         core_tm.export(core_path)
-        print(f"core insert: {core_path}  watertight={core_tm.is_watertight}  "
+        print(f"core insert: {core_path}  watertight={verify_watertight(core_path)}  "
               f"volume={core.volume():.1f} mm3")
         print("Insert the core from below (flange side) until the flange "
               "seats against the mold's bottom; pull it back out once the "
@@ -627,6 +758,14 @@ def main():
                          "filament. Most worthwhile on larger molds.")
     p.add_argument("--skin", type=float, default=2.0,
                     help="Outer skin thickness when --hollow is set (mm)")
+    p.add_argument("--open-back", action="store_true",
+                    help="With --hollow: leave off each half's outer face "
+                         "(opposite the cavity) entirely instead of skinning "
+                         "it, replacing it with a '+' shaped brace standing "
+                         "perpendicular to it for rigidity - a vacuum-formed-"
+                         "shell look rather than a fully boxed-in shell.")
+    p.add_argument("--cross-width", type=float, default=4.0,
+                    help="Width of each brace rib when --open-back is set (mm)")
     p.add_argument("--preview", action="store_true",
                     help="Save a shaded preview PNG (exploded view normally, "
                          "or a cutaway if --sleeve is set)")
@@ -665,6 +804,8 @@ def main():
         vent_offset_xy=tuple(args.vent_offset),
         hollow=args.hollow,
         skin=args.skin,
+        open_back=args.open_back,
+        cross_width=args.cross_width,
         sleeve=args.sleeve,
         sleeve_wall=args.sleeve_wall,
         sleeve_clearance=args.sleeve_clearance,

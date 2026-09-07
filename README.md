@@ -102,11 +102,14 @@ use on larger molds.
 |---|---|---|
 | `--hollow` | off | Hollow the mold bulk into a shell |
 | `--skin` | `2.0` | Outer skin thickness when `--hollow` is set (mm) |
+| `--open-back` | off | With `--hollow`: leave off each half's outer face entirely (the one opposite the cavity, parallel to it) instead of skinning it over, replacing it with a "+"-shaped brace standing perpendicular to it — a vacuum-formed-shell look (contoured wall + side walls + open back) rather than a fully boxed-in shell |
+| `--cross-width` | `4.0` | Width of each brace rib when `--open-back` is set (mm) |
 
 Material savings scale with mold size: a small mold is mostly wall already,
-so there's little to remove; a large one can save roughly half its volume.
-For a very wide, unsupported span of skin over the void, consider adding
-internal ribs manually before printing, or leave `--hollow` off for that mold.
+so there's little to remove; a large one can save roughly half its volume,
+more with `--open-back`. For a very wide, unsupported span of skin over the
+void, consider adding internal ribs manually before printing, or leave
+`--hollow` off for that mold.
 
 ### Sleeve mode (hollow casts)
 
@@ -178,3 +181,22 @@ anything hot (e.g. wax).
   internal ribs added separately.
 - Pin placement is corner-based and can land in the cavity on thin or
   oddly-shaped parts — increase `--pin-margin` if that happens.
+- `--open-back` combined with `--sleeve`: the core's flange is designed to
+  seat flush against a solid outer face. With the outer face open, it only
+  finds solid material where it lands on the side-wall ring or the cross,
+  not across its whole area — usually fine, but check the flange size/
+  position for your model if you combine the two.
+
+### A note on watertightness checks
+
+Earlier versions of this script trusted the in-memory mesh's own
+`is_watertight` check when reporting status. That turned out to be
+unreliable in both directions - a mesh could show `True` in memory and
+fail once exported and reloaded (STL has no shared-vertex topology, so
+export/reload reconstructs it from scratch and can expose a handful of
+near-miss vertices or degenerate leftover faces from a long boolean chain),
+or the reverse. The script now reloads each exported file to report its
+actual status, and does a degenerate-face cleanup pass before export. If
+you're on an older copy of this script and see `--hollow` output that
+looks off in a slicer despite a "watertight=True" printout, that's why -
+grab the current version.
