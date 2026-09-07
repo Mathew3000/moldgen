@@ -152,15 +152,81 @@ def cylinder_along_axis(height, r1, r2, segments, axis):
     raise ValueError(f"bad axis {axis!r}")
 
 
-def final_frame_axis(up_axis, axis):
-    """Which output axis (0=x,1=y,2=z), after rotating back from the internal
-    up=Z working frame to the model's original orientation, `axis` (named in
-    that working frame) ends up along. Used only for preview rendering."""
-    rot = _AXIS_TO_Z[up_axis]
-    v = np.zeros(3)
-    v[_axis_index(axis)] = 1.0
-    v2 = rot.T @ v
-    return int(np.argmax(np.abs(v2)))
+# --------------------------------------------------------------------------
+# Multi-part splitting: a list of seams instead of one. Each seam is still a
+# full axis-aligned plane (T's partial seam and Y's angled ones are a later
+# step) - this generalizes the existing single-seam case (which still uses
+# the exact same code path with a 1-element seam list) to N seams -> 2^N
+# pieces, tracking which side of each seam every piece landed on so pins
+# can be placed between the right adjacent pairs and pieces can be named
+# meaningfully.
+# --------------------------------------------------------------------------
+
+def split_multi(body, seams):
+    """body, [{'axis':.., 'offset':..}, ...] -> (pieces, sides)
+    sides[i] is a tuple of +1/-1 per seam, matching pieces[i] - which side
+    of each seam that piece is on."""
+    pieces = [body]
+    sides = [()]
+    for seam in seams:
+        normal = point_from_axes({seam["axis"]: 1.0})
+        new_pieces, new_sides = [], []
+        for p, s in zip(pieces, sides):
+            pos, neg = p.split_by_plane(normal, seam["offset"])
+            new_pieces.append(pos)
+            new_sides.append(s + (1,))
+            new_pieces.append(neg)
+            new_sides.append(s + (-1,))
+        pieces, sides = new_pieces, new_sides
+    return pieces, sides
+
+
+def piece_bounds(blank_bounds, seams, piece_sides):
+    """The analytic (not geometry-derived) bounding box of a piece within
+    the padded blank, given which side of each seam it's on - used for pin
+    placement so corners land at the piece's true slot in the mold rather
+    than wherever carved solid geometry happens to be (which can be void
+    in hollow mode)."""
+    b = dict(blank_bounds)
+    for seam, side in zip(seams, piece_sides):
+        lo, hi = b[seam["axis"]]
+        b[seam["axis"]] = (seam["offset"], hi) if side > 0 else (lo, seam["offset"])
+    return b
+
+
+def piece_name(seams, piece_sides):
+    return "_".join(
+        f"{seam['axis']}{'p' if side > 0 else 'n'}"
+        for seam, side in zip(seams, piece_sides)
+    )
+
+
+def add_pins_multi(pieces, sides, seams, blank_bounds, wall,
+                    n_pins, pin_dia, fit_clearance, pin_margin):
+    """Add registration pins between every pair of pieces that are adjacent
+    across a seam (their side-tuples differ at exactly one position)."""
+    pieces = list(pieces)
+    for i, seam in enumerate(seams):
+        seam_axis = seam["axis"]
+        for a in range(len(pieces)):
+            for b in range(a + 1, len(pieces)):
+                sa, sb = sides[a], sides[b]
+                if sa[i] == sb[i]:
+                    continue
+                if any(sa[j] != sb[j] for j in range(len(seams)) if j != i):
+                    continue
+                # a, b are adjacent across seam i - whichever is on the
+                # +side is "part_pos" (gets the socket), -side is
+                # "part_neg" (gets the male pin), matching the single-seam
+                # convention.
+                pos_idx, neg_idx = (a, b) if sa[i] > 0 else (b, a)
+                bounds = piece_bounds(blank_bounds, seams, sa)
+                pos, neg = add_registration_pins(
+                    pieces[pos_idx], pieces[neg_idx], bounds, seam_axis,
+                    seam["offset"], wall, n_pins, pin_dia, fit_clearance, pin_margin,
+                )
+                pieces[pos_idx], pieces[neg_idx] = pos, neg
+    return pieces
 
 
 # --------------------------------------------------------------------------
@@ -301,7 +367,7 @@ def face_slab(bounds, axis, side, thickness):
     return mf.Manifold.cube(point_from_axes(dims), center=False).translate(point_from_axes(origin))
 
 
-def hollow_body(model, blank, wall, skin, seam_axis, seam_offset,
+def hollow_body(model, blank, wall, skin, seams,
                  open_back=False, cross_width=4.0):
     """Turn a solid `blank - model` body into a shell to save filament.
 
@@ -310,19 +376,25 @@ def hollow_body(model, blank, wall, skin, seam_axis, seam_offset,
         what actually defines the cast - keep it exactly as designed).
       - skin_shell:   material within `skin` of the mold's outer faces
                        (rigidity + a printable, closed outer surface).
-      - seam_slab:    a full-footprint solid band around the seam plane
-                       (whichever axis it's perpendicular to), so the
-                       parting face stays flat/sealed and there's solid
-                       material for the registration pins to embed into.
+      - seam_slab:    a full-footprint solid band around each seam plane in
+                       `seams` (whichever axis each is perpendicular to), so
+                       every parting face stays flat/sealed and there's
+                       solid material for the registration pins to embed
+                       into.
     Everything else in the original solid bulk becomes empty void.
 
-    With `open_back`, this becomes closer to a vacuum-formed shell: the two
-    outer faces perpendicular to seam_axis (each half's own "back", opposite
-    the cavity - the ones with the least functional need to be solid, since
-    they don't seal against anything) are left off skin_shell entirely, and
-    replaced with a "+"-shaped brace standing perpendicular to them (in the
-    same two planes as the four side walls, running the full depth) for
-    rigidity in place of a full panel.
+    `seams` is a list of {'axis':.., 'offset':..} - one full-plane seam slab
+    is added per entry, so this works unchanged for both the single-seam
+    case and multi-part splits.
+
+    With `open_back` (single-seam only, see caller-side guard), this becomes
+    closer to a vacuum-formed shell: the two outer faces perpendicular to
+    the seam axis (each half's own "back", opposite the cavity - the ones
+    with the least functional need to be solid, since they don't seal
+    against anything) are left off skin_shell entirely, and replaced with a
+    "+"-shaped brace standing perpendicular to them (in the same two planes
+    as the four side walls, running the full depth) for rigidity in place
+    of a full panel.
 
     Note: without open_back, for large molds the unsupported span of skin
     over the void can be significant - if it's wide, add internal ribs/
@@ -345,9 +417,10 @@ def hollow_body(model, blank, wall, skin, seam_axis, seam_offset,
     cavity_shell = grown - model
 
     bounds = bbox_dict(blank.bounding_box())
-    u_axis, v_axis = other_axes(seam_axis)
 
     if open_back:
+        seam_axis = seams[0]["axis"]
+        u_axis, v_axis = other_axes(seam_axis)
         # Only the 4 side faces (S) - leave both seam_axis-facing faces (O,
         # each half's own "back") out entirely.
         skin_shell = (
@@ -378,23 +451,28 @@ def hollow_body(model, blank, wall, skin, seam_axis, seam_offset,
         )
         skin_shell = blank - inner
 
-    # Seam slab: keep a solid band (+-wall) around the parting plane, full
-    # extent in the other two axes - unaffected by open_back, this is a
-    # different face (the parting line) and always needs to stay solid.
-    slab_dims = {
-        seam_axis: 2 * wall,
-        u_axis: bounds[u_axis][1] - bounds[u_axis][0],
-        v_axis: bounds[v_axis][1] - bounds[v_axis][0],
-    }
-    slab_origin = {
-        seam_axis: seam_offset - wall,
-        u_axis: bounds[u_axis][0],
-        v_axis: bounds[v_axis][0],
-    }
-    seam_box = mf.Manifold.cube(point_from_axes(slab_dims), center=False).translate(
-        point_from_axes(slab_origin)
-    )
-    seam_slab = seam_box ^ blank
+    # Seam slab(s): keep a solid band (+-wall) around every parting plane,
+    # full extent in the other two axes - unaffected by open_back, these are
+    # different faces (the parting lines) and always need to stay solid.
+    seam_slab = None
+    for seam in seams:
+        seam_axis = seam["axis"]
+        u_axis, v_axis = other_axes(seam_axis)
+        slab_dims = {
+            seam_axis: 2 * wall,
+            u_axis: bounds[u_axis][1] - bounds[u_axis][0],
+            v_axis: bounds[v_axis][1] - bounds[v_axis][0],
+        }
+        slab_origin = {
+            seam_axis: seam["offset"] - wall,
+            u_axis: bounds[u_axis][0],
+            v_axis: bounds[v_axis][0],
+        }
+        seam_box = mf.Manifold.cube(point_from_axes(slab_dims), center=False).translate(
+            point_from_axes(slab_origin)
+        )
+        one_slab = seam_box ^ blank
+        seam_slab = one_slab if seam_slab is None else (seam_slab + one_slab)
 
     kept = cavity_shell + skin_shell + seam_slab
     kept = (kept ^ blank) - model
@@ -470,13 +548,21 @@ def build_core(model, base_poly, wall, sleeve_wall, zmin, clearance,
 # Main pipeline
 # --------------------------------------------------------------------------
 
-def generate_mold(input_path, out_prefix, wall, up_axis, seam_axis, seam_fraction,
+def generate_mold(input_path, out_prefix, wall, up_axis, seam_axes, seam_fractions,
                    n_pins, pin_dia, fit_clearance, pin_margin,
                    funnel_top_dia, funnel_bot_dia, funnel_overlap,
                    pour_offset_xy, vent_dia, vent_offset_xy,
                    hollow=False, skin=2.0, open_back=False, cross_width=4.0,
                    sleeve=False, sleeve_wall=3.0, sleeve_clearance=0.3,
                    sleeve_flange_margin=3.0, sleeve_flange_thickness=2.5):
+
+    if len(seam_axes) != len(seam_fractions):
+        raise ValueError("--seam-axis and --seam must have the same number of values.")
+    if len(seam_axes) > 1 and (sleeve or open_back):
+        raise ValueError(
+            "--sleeve and --open-back aren't supported with multiple seams yet - "
+            "each assumes a single parting line. Use one --seam-axis for now."
+        )
 
     src = trimesh.load(input_path, force="mesh")
     if not isinstance(src, trimesh.Trimesh):
@@ -511,12 +597,15 @@ def generate_mold(input_path, out_prefix, wall, up_axis, seam_axis, seam_fractio
         center=False,
     ).translate((xmin - wall, ymin - wall, 0))
 
-    # Seam plane: perpendicular to `seam_axis` (default z = horizontal, the
-    # classic clamshell; x or y gives a vertical seam for models with side
-    # undercuts instead of top/bottom ones), at `seam_fraction` of the
-    # model's extent along that axis.
-    seam_lo, seam_hi = model_bounds[seam_axis]
-    seam_offset = seam_lo + seam_fraction * (seam_hi - seam_lo)
+    # Seam planes: perpendicular to each axis in `seam_axes` (default z =
+    # horizontal, the classic clamshell; x or y gives a vertical seam for
+    # models with side undercuts), at the matching fraction of the model's
+    # extent along that axis. One seam -> 2 pieces (top/bottom); two seams
+    # -> 4 pieces (a +/X split); three -> 8.
+    seams = []
+    for axis, frac in zip(seam_axes, seam_fractions):
+        lo, hi = model_bounds[axis]
+        seams.append({"axis": axis, "offset": lo + frac * (hi - lo)})
 
     # Build the funnel (and vent) solids now, before hollowing - so that if
     # hollowing is on, it can add a proper wall-thickness jacket around the
@@ -539,7 +628,7 @@ def generate_mold(input_path, out_prefix, wall, up_axis, seam_axis, seam_fractio
 
     # 2b. Optionally hollow the bulk out into a shell to save filament
     if hollow:
-        body = hollow_body(model, blank, wall, skin, seam_axis, seam_offset,
+        body = hollow_body(model, blank, wall, skin, seams,
                             open_back=open_back, cross_width=cross_width)
         # Give the pour channel(s) a proper wall-thickness jacket, since
         # otherwise whatever part of them is past cavity_shell's reach
@@ -555,7 +644,8 @@ def generate_mold(input_path, out_prefix, wall, up_axis, seam_axis, seam_fractio
 
     # 2c. Optionally cut a base opening and build the core insert, so the
     #     mold casts a hollow shell rather than a solid part. (Always tied
-    #     to the up-axis/floor, independent of seam_axis.)
+    #     to the up-axis/floor, independent of seam axis; guarded above to
+    #     single-seam only.)
     core = None
     if sleeve:
         base_poly = base_footprint(model, zmin)
@@ -567,42 +657,42 @@ def generate_mold(input_path, out_prefix, wall, up_axis, seam_axis, seam_fractio
 
     # 3. Actually open the pour funnel and vent up now, subtracting the same
     #    solids used above - bored before splitting, so with a vertical seam
-    #    this naturally divides the channel between both halves (the
-    #    standard way real 2-part molds route a sprue across a vertical
-    #    parting line), and for the default horizontal seam it lands
-    #    entirely in the top half exactly as before.
+    #    this naturally divides the channel between the pieces on either
+    #    side of it (the standard way real 2-part molds route a sprue
+    #    across a vertical parting line), and for the default horizontal
+    #    seam it lands entirely in the top piece exactly as before.
     body = body - funnel_solid
     if vent_solid is not None:
         body = body - vent_solid
 
-    # 4. Split on the seam plane
-    seam_normal = point_from_axes({seam_axis: 1.0})
-    top, bottom = body.split_by_plane(seam_normal, seam_offset)
+    # 4. Split on every seam plane -> 2^len(seams) pieces
+    pieces, sides = split_multi(body, seams)
 
-    # 5. Registration pins
+    # 5. Registration pins between every pair of pieces adjacent across a seam
     blank_bounds = bbox_dict(blank.bounding_box())
-    top, bottom = add_registration_pins(
-        top, bottom, blank_bounds, seam_axis, seam_offset, wall,
-        n_pins, pin_dia, fit_clearance, pin_margin,
-    )
+    pieces = add_pins_multi(pieces, sides, seams, blank_bounds, wall,
+                             n_pins, pin_dia, fit_clearance, pin_margin)
 
-    if top.is_empty() or bottom.is_empty():
-        raise RuntimeError("A mold half came out empty - check parameters.")
+    if any(p.is_empty() for p in pieces):
+        raise RuntimeError("A mold piece came out empty - check parameters.")
 
-    # 6. Back to trimesh, rotate back to original orientation, export
+    # 6. Back to trimesh, rotate back to original orientation, export.
+    # Single seam keeps the familiar _top/_bottom names; multi-seam uses a
+    # name built from each piece's side of every seam (e.g. "zp_xp").
     inv_rot = rot.T  # rotation matrices are orthonormal
-    top_tm = rotate_mesh(manifold_to_trimesh(top), inv_rot)
-    bottom_tm = rotate_mesh(manifold_to_trimesh(bottom), inv_rot)
-
-    top_path = f"{out_prefix}_top.stl"
-    bottom_path = f"{out_prefix}_bottom.stl"
-    top_tm.export(top_path)
-    bottom_tm.export(bottom_path)
-
-    print(f"top half:    {top_path}  watertight={verify_watertight(top_path)}  "
-          f"volume={top.volume():.1f} mm3")
-    print(f"bottom half: {bottom_path}  watertight={verify_watertight(bottom_path)}  "
-          f"volume={bottom.volume():.1f} mm3")
+    piece_paths, piece_tms = [], []
+    for p, s in zip(pieces, sides):
+        tm = rotate_mesh(manifold_to_trimesh(p), inv_rot)
+        if len(seams) == 1:
+            label = "top" if s[0] > 0 else "bottom"
+        else:
+            label = piece_name(seams, s)
+        path = f"{out_prefix}_{label}.stl"
+        tm.export(path)
+        print(f"{label + ':':13s}{path}  watertight={verify_watertight(path)}  "
+              f"volume={p.volume():.1f} mm3")
+        piece_paths.append(path)
+        piece_tms.append(tm)
 
     core_tm = None
     core_path = None
@@ -618,7 +708,7 @@ def generate_mold(input_path, out_prefix, wall, up_axis, seam_axis, seam_fractio
               "seats against the mold's bottom; pull it back out once the "
               "shell has set.")
 
-    return top_path, bottom_path, top_tm, bottom_tm, core_path, core_tm
+    return piece_paths, piece_tms, sides, seams, core_path, core_tm
 
 
 # --------------------------------------------------------------------------
@@ -627,18 +717,31 @@ def generate_mold(input_path, out_prefix, wall, up_axis, seam_axis, seam_fractio
 # in a plain server/CLI environment).
 # --------------------------------------------------------------------------
 
-def render_preview(top_tm, bottom_tm, out_path, up_axis="z", seam_axis="z",
+def final_frame_component(up_axis, axis):
+    """(index, sign) - which output axis (0=x,1=y,2=z), and with which
+    sign, `axis` (named in the up=Z working frame) maps to after rotating
+    back to the model's original orientation. Used for preview rendering."""
+    rot = _AXIS_TO_Z[up_axis]
+    v = np.zeros(3)
+    v[_axis_index(axis)] = 1.0
+    v2 = rot.T @ v
+    idx = int(np.argmax(np.abs(v2)))
+    sign = 1.0 if v2[idx] >= 0 else -1.0
+    return idx, sign
+
+
+_PIECE_PALETTE = [
+    (0.35, 0.65, 0.85), (0.95, 0.65, 0.25), (0.80, 0.35, 0.55), (0.45, 0.75, 0.45),
+    (0.75, 0.55, 0.85), (0.90, 0.75, 0.30), (0.40, 0.70, 0.75), (0.85, 0.45, 0.35),
+]
+
+
+def render_preview(piece_tms, sides, seams, out_path, up_axis="z",
                     explode=None, core_tm=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-
-    # The two returned pieces separate along `seam_axis` as named in the
-    # internal up=Z working frame; top_tm/bottom_tm have already been
-    # rotated back to the model's original orientation, so map that axis
-    # through the same rotation to find which output axis it lands on.
-    axis_idx = final_frame_axis(up_axis, seam_axis)
 
     def shaded_facecolors(mesh, base_rgb, light_dir=(0.5, 0.4, 0.75)):
         light_dir = np.array(light_dir, dtype=float)
@@ -672,13 +775,18 @@ def render_preview(top_tm, bottom_tm, out_path, up_axis="z", seam_axis="z",
     ax = fig.add_subplot(111, projection="3d")
 
     if core_tm is not None:
-        # Sleeve mode: an exploded view would hide the fit, so instead cut
-        # each assembled piece in half and view into the cut to show the
-        # core sitting inside the cavity with the shell gap around it.
-        # Cut via manifold3d's own trim_by_plane rather than trimesh's
-        # slice_mesh_plane(cap=True), which pulls in scipy/shapely/rtree/
-        # networkx just to cap a triangle hole - manifold3d is already a
-        # hard dependency and produces a clean capped cut natively.
+        # Sleeve mode (single-seam only): an exploded view would hide the
+        # fit, so instead cut each assembled piece in half and view into
+        # the cut to show the core sitting inside the cavity with the
+        # shell gap around it. Cut via manifold3d's own trim_by_plane
+        # rather than trimesh's slice_mesh_plane(cap=True), which pulls in
+        # scipy/shapely/rtree/networkx just to cap a triangle hole -
+        # manifold3d is already a hard dependency and produces a clean
+        # capped cut natively.
+        top_tm, bottom_tm = (
+            (piece_tms[0], piece_tms[1]) if sides[0][0] > 0 else (piece_tms[1], piece_tms[0])
+        )
+
         def half(mesh):
             man = trimesh_to_manifold(mesh)
             trimmed = man.trim_by_plane((0, -1, 0), 0.0)
@@ -691,15 +799,21 @@ def render_preview(top_tm, bottom_tm, out_path, up_axis="z", seam_axis="z",
         draw(ax, parts, azim=90)
     else:
         if explode is None:
-            explode = max(top_tm.extents.max(), bottom_tm.extents.max()) * 0.4
+            explode = max(tm.extents.max() for tm in piece_tms) * 0.4
+        # Each seam's axis (named in the up=Z working frame) maps to some
+        # signed output axis once rotated back; a piece's explode direction
+        # is the sum of its side (+/-1) on every seam, in that seam's
+        # mapped direction - so a 4-piece +/X split fans diagonally outward
+        # and the single-seam case reduces to exactly the old behavior.
+        components = [final_frame_component(up_axis, seam["axis"]) for seam in seams]
         parts = []
-        for mesh, base_rgb, sign in [(bottom_tm, (0.35, 0.65, 0.85), -1.0),
-                                      (top_tm, (0.95, 0.65, 0.25), 1.0)]:
-            m = mesh.copy()
+        for i, (tm, s) in enumerate(zip(piece_tms, sides)):
             shift = np.zeros(3)
-            shift[axis_idx] = explode * sign
+            for (idx, sign), side_sign in zip(components, s):
+                shift[idx] += explode * sign * side_sign
+            m = tm.copy()
             m.apply_translation(shift)
-            parts.append((m, base_rgb))
+            parts.append((m, _PIECE_PALETTE[i % len(_PIECE_PALETTE)]))
         draw(ax, parts, azim=-50, elev=22)
 
     plt.tight_layout()
@@ -720,14 +834,16 @@ def main():
     p.add_argument("--wall", type=float, default=3.0, help="Mold wall thickness (mm)")
     p.add_argument("--up", choices=["x", "y", "z"], default="z",
                     help="Which model axis points 'up' toward the pour side")
-    p.add_argument("--seam-axis", choices=["x", "y", "z"], default="z",
-                    help="Which axis the parting plane is perpendicular to: "
-                         "z = horizontal/classic clamshell (default), x or y = "
-                         "vertical seam, for models with undercuts on the sides "
-                         "rather than top/bottom")
-    p.add_argument("--seam", type=float, default=0.5,
-                    help="Seam position as a fraction (0-1) of the model's "
-                         "extent along --seam-axis")
+    p.add_argument("--seam-axis", choices=["x", "y", "z"], default=["z"], nargs="+",
+                    help="Which axis each parting plane is perpendicular to. One "
+                         "value (default z) = the classic 2-piece clamshell; x or y "
+                         "= a vertical seam instead, for undercuts on the sides "
+                         "rather than top/bottom. Two values = a 4-piece +/X split "
+                         "(both seams full planes); three = 8 pieces. Pair "
+                         "positionally with --seam.")
+    p.add_argument("--seam", type=float, default=[0.5], nargs="+",
+                    help="Seam position(s) as a fraction (0-1) of the model's "
+                         "extent along the matching --seam-axis entry")
     p.add_argument("--pins", type=int, default=2, choices=[2, 3, 4],
                     help="Number of registration pins")
     p.add_argument("--pin-dia", type=float, default=5.0, help="Pin diameter (mm)")
@@ -785,13 +901,13 @@ def main():
 
     pin_margin = args.pin_margin if args.pin_margin is not None else args.wall * 1.5
 
-    top_path, bottom_path, top_tm, bottom_tm, core_path, core_tm = generate_mold(
+    piece_paths, piece_tms, sides, seams, core_path, core_tm = generate_mold(
         input_path=args.input,
         out_prefix=args.out,
         wall=args.wall,
         up_axis=args.up,
-        seam_axis=args.seam_axis,
-        seam_fraction=args.seam,
+        seam_axes=args.seam_axis,
+        seam_fractions=args.seam,
         n_pins=args.pins,
         pin_dia=args.pin_dia,
         fit_clearance=args.fit_clearance,
@@ -814,8 +930,8 @@ def main():
     )
 
     if args.preview:
-        render_preview(top_tm, bottom_tm, f"{args.out}_preview.png",
-                        up_axis=args.up, seam_axis=args.seam_axis, core_tm=core_tm)
+        render_preview(piece_tms, sides, seams, f"{args.out}_preview.png",
+                        up_axis=args.up, core_tm=core_tm)
 
 
 if __name__ == "__main__":

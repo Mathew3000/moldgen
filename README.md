@@ -63,8 +63,8 @@ python moldgen.py MODEL --out PREFIX [options]
 | `--out` | `mold` | Output filename prefix |
 | `--wall` | `3.0` | Mold wall thickness (mm) |
 | `--up` | `z` | Which model axis points "up" toward the pour side |
-| `--seam-axis` | `z` | Which axis the parting plane is perpendicular to. `z` = horizontal/classic clamshell. `x` or `y` = vertical seam, for models with undercuts on the sides rather than top/bottom |
-| `--seam` | `0.5` | Seam position as a fraction (0–1) of the model's extent along `--seam-axis` |
+| `--seam-axis` | `z` | Which axis each parting plane is perpendicular to. One value (default) = the classic 2-piece clamshell. `x`/`y` = a vertical seam instead, for undercuts on the sides rather than top/bottom. **Two values = a 4-piece +/X split; three = 8 pieces.** Pair positionally with `--seam` |
+| `--seam` | `0.5` | Seam position(s) as a fraction (0–1) of the model's extent along the matching `--seam-axis` entry |
 | `--preview` | off | Save a shaded preview PNG next to the STLs (exploded view, or a cutaway if `--sleeve` is set) |
 
 `--up` and `--seam-axis` are independent: `--up` decides which way the
@@ -134,14 +134,16 @@ a depth stop and a grip.
 
 | File | Produced when |
 |---|---|
-| `PREFIX_top.stl` | always |
-| `PREFIX_bottom.stl` | always |
+| `PREFIX_top.stl` / `PREFIX_bottom.stl` | one `--seam-axis` (the default) |
+| `PREFIX_<code>.stl` (one per piece) | two or more `--seam-axis` values |
 | `PREFIX_core.stl` | `--sleeve` |
 | `PREFIX_preview.png` | `--preview` |
 
-"Top"/"bottom" mean the +axis/−axis side of `--seam-axis`, whatever that
-axis is — the names are kept for both a horizontal and a vertical seam for
-consistency.
+With a single seam, "top"/"bottom" mean the +axis/−axis side of
+`--seam-axis`, whatever that axis is — kept for both a horizontal and a
+vertical seam for consistency. With multiple seams, each piece is named by
+its side of every seam, e.g. `PREFIX_zp_xn.stl` for the piece on the +Z
+side of the first seam and the −X side of the second.
 
 ## Examples
 
@@ -158,6 +160,16 @@ python moldgen.py vase.stl --out vase_mold --wall 3 --hollow --skin 2 --pins 4 -
 Vertical seam for a model with side undercuts:
 ```
 python moldgen.py bust.stl --out bust_mold --seam-axis x --pins 4
+```
+
+4-piece mold (a "+"/X split — two full seams, giving 4 quarter-pieces):
+```
+python moldgen.py figurine.stl --out fig_mold --seam-axis z x --seam 0.5 0.5 --pins 4 --preview
+```
+
+8-piece mold (three full seams, one octant per piece):
+```
+python moldgen.py figurine.stl --out fig_mold --seam-axis z x y --seam 0.5 0.5 0.5 --pins 2
 ```
 
 Hollow-cast candle with a removable core:
@@ -181,11 +193,15 @@ anything hot (e.g. wax).
   internal ribs added separately.
 - Pin placement is corner-based and can land in the cavity on thin or
   oddly-shaped parts — increase `--pin-margin` if that happens.
-- `--open-back` combined with `--sleeve`: the core's flange is designed to
-  seat flush against a solid outer face. With the outer face open, it only
-  finds solid material where it lands on the side-wall ring or the cross,
-  not across its whole area — usually fine, but check the flange size/
-  position for your model if you combine the two.
+- `--open-back` combined with `--sleeve` (still single-seam only): the
+  core's flange is designed to seat flush against a solid outer face. With
+  the outer face open, it only finds solid material where it lands on the
+  side-wall ring or the cross, not across its whole area — usually fine,
+  but check the flange size/position for your model if you combine the two.
+- `--sleeve` and `--open-back` currently only support a single `--seam-axis`
+  — each assumes one parting line. Using either with multiple seams raises
+  an error rather than producing something subtly wrong; support for both
+  is planned.
 
 ### A note on watertightness checks
 
