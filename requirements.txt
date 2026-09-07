@@ -1,0 +1,15 @@
+# moldgen.py dependencies
+# install with: pip install -r requirements.txt
+#   (on Debian/Ubuntu-managed Python you may need:
+#    pip install -r requirements.txt --break-system-packages)
+#
+# Verified: full feature matrix (solid, --hollow, --sleeve, --preview,
+# and combinations) runs clean in a fresh venv with only these 4 packages -
+# no scipy/shapely/rtree/networkx needed.
+
+numpy>=1.24
+trimesh>=4.0        # STL/OBJ/3MF I/O - tested against 5.1.0
+manifold3d>=3.0      # boolean CSG engine - tested against 3.5.2
+
+# Only needed if you use --preview (renders a PNG with matplotlib)
+matplotlib>=3.7

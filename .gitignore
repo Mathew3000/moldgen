@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+*.stl
+*.obj
+*.3mf
+*.png
